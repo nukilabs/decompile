@@ -11,9 +11,13 @@ import (
 )
 
 // Structure structures the control flow graph into primitives.
-func Structure[N comparable](g *graph.Graph[N], dom *dominator.Tree[N]) ([]Primitive[N], error) {
+func Structure[N comparable](g *graph.Graph[N]) ([]Primitive[N], error) {
 	prims := make([]Primitive[N], 0)
 	errs := make([]error, 0)
+	// Initialize the control flow graph.
+	g.InitOrder()
+	// Compute the dominator tree.
+	dom := dominator.New(g)
 	// Structure loops in the control flow graph.
 	loops, err := StructureLoops(g, dom)
 	if err != nil {
