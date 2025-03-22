@@ -46,7 +46,7 @@ func StructureLoops[N comparable](g *graph.Graph[N], dom *dominator.Tree[N]) ([]
 					errs = append(errs, err)
 					continue
 				}
-				follow, err := findLoopFollow(g, kind, head, latch, nodes)
+				follow, err := findLoopFollow(g, kind, head, latch, nodes, dom)
 				if err != nil {
 					errs = append(errs, err)
 					continue
@@ -202,45 +202,49 @@ func markNodesInLoop[N comparable](g *graph.Graph[N], head, latch *graph.Node[N]
 	return nodes
 }
 
-// findLoopKind returns the kind of the loop (latch, head).
+// findLoopKind determines the structural type of a loop based on the control flow properties
+// of its header and latch nodes, returning one of PreTestedLoop, PostTestedLoop, or EndlessLoop.
 func findLoopKind[N comparable](g *graph.Graph[N], head, latch *graph.Node[N], nodes []*graph.Node[N]) (PrimitiveKind, error) {
-	// Add extra case not present in Cifuentes' for when head == latch.
+	// Special case: self-loop where the header is also the latch
+	// This forms a post-tested loop structure (do-while loop)
 	if head.ID() == latch.ID() {
 		return PostTestedLoop, nil
 	}
+
 	headSuccs := g.Successors(head)
 	latchSuccs := g.Successors(latch)
+
 	switch len(latchSuccs) {
-	// if (nodeType(y) == 2-way)
+	// Case: Latch node has 2 outgoing edges (conditional latch)
 	case 2:
 		switch len(headSuccs) {
-		// if (nodeType(x) == 2-way)
+		// Case: Header node has 2 outgoing edges (conditional header)
 		case 2:
-			// if (outEdge(x, 1) \in nodesInLoop \land (outEdge(x, 2) \in nodesInLoop)
+			// If both successors of the header are within the loop,
+			// then the loop condition is evaluated at the end (post-tested/do-while loop)
 			if contains(nodes, headSuccs[0]) && contains(nodes, headSuccs[1]) {
-				// loopType(x) = Post_Tested.
 				return PostTestedLoop, nil
 			} else {
-				// loopType(x) = Pre_Tested.
+				// Otherwise, the loop condition is evaluated at the beginning (pre-tested/while loop)
 				return PreTestedLoop, nil
 			}
-		// 1-way header node.
+		// Case: Header node has 1 outgoing edge (unconditional header)
 		case 1:
-			// loopType(x) = Post_Tested.
+			// With unconditional header but conditional latch, this is a post-tested loop
 			return PostTestedLoop, nil
 		default:
 			return None, fmt.Errorf("unsupported %d-way header node", len(headSuccs))
 		}
-	// 1-way latching node.
+	// Case: Latch node has 1 outgoing edge (unconditional latch)
 	case 1:
 		switch len(headSuccs) {
-		// if nodeType(x) == 2-way
+		// Case: Header node has 2 outgoing edges (conditional header)
 		case 2:
-			// loopType(x) = Pre_Tested.
+			// With conditional header but unconditional latch, this is a pre-tested loop
 			return PreTestedLoop, nil
-		// 1-way header node.
+		// Case: Header node has 1 outgoing edge (unconditional header)
 		case 1:
-			// loopType(x) = Endless.
+			// With both unconditional header and latch, this forms an endless loop
 			return EndlessLoop, nil
 		default:
 			return None, fmt.Errorf("unsupported %d-way header node", len(headSuccs))
@@ -251,65 +255,93 @@ func findLoopKind[N comparable](g *graph.Graph[N], head, latch *graph.Node[N], n
 }
 
 // findLoopFollow returns the follow node of the loop (latch, head).
-func findLoopFollow[N comparable](g *graph.Graph[N], kind PrimitiveKind, head, latch *graph.Node[N], nodes []*graph.Node[N]) (*graph.Node[N], error) {
+func findLoopFollow[N comparable](g *graph.Graph[N], kind PrimitiveKind, head, latch *graph.Node[N], nodes []*graph.Node[N], dom *dominator.Tree[N]) (*graph.Node[N], error) {
 	headSuccs := g.Successors(head)
 	latchSuccs := g.Successors(latch)
+
 	switch kind {
-	// if (loopType(x) == Pre_Tested)
 	case PreTestedLoop:
+		// For a pre-tested loop, we need to identify which successor of the head node
+		// is the loop follow (exit) node, and which one leads to the loop body.
+		targetNode := latch
+		// Walk up the dominator tree from the latch until we find a node that is
+		// a direct successor of the head node. This helps identify the branch
+		// that leads to the loop body.
+		for targetNode.ID() != headSuccs[0].ID() && targetNode.ID() != headSuccs[1].ID() {
+			targetNode = dom.DominatorOf(targetNode)
+		}
+
 		switch {
-		// if (outEdges(x, 1) \in nodesInLoop)
-		case contains(nodes, headSuccs[0]):
-			// loopFollow(x) = outEdges(x, 2)
-			return headSuccs[1], nil
-		case contains(nodes, headSuccs[1]):
-			// loopFollow(x) = outEdges(x, 1)
-			return headSuccs[0], nil
+		// Case 1: The first successor is inside the loop, meaning the second successor
+		// must be the follow node (exit path). We verify this by ensuring:
+		// - The first successor is part of the loop nodes
+		// - The second successor is not the latch node itself
+		// - The dominant path from latch doesn't lead to the second successor
+		case contains(nodes, headSuccs[0]) && headSuccs[1] != latch && targetNode.ID() != headSuccs[1].ID():
+			return headSuccs[1], nil // The second successor is the loop follow node
+
+		// Case 2: The second successor is inside the loop, meaning the first successor
+		// must be the follow node (exit path)
+		case contains(nodes, headSuccs[1]) && headSuccs[0] != latch:
+			return headSuccs[0], nil // The first successor is the loop follow node
+
 		default:
+			// If we can't determine the follow node with the above rules,
+			// the loop structure might be abnormal or complex
 			return nil, errors.New("unable to locate follow node of pre-tested loop")
 		}
-	// else if (loopType(x) == Post_Tested)
+
 	case PostTestedLoop:
 		switch {
-		// if (outEdges(y, 1) \in nodesInLoop)
+		// If the first successor of the latch node is inside the loop,
+		// the second successor must be the exit point (follow node)
 		case contains(nodes, latchSuccs[0]):
-			// loopFollow(x) = outEdges(y, 2)
 			return latchSuccs[1], nil
+
+		// If the second successor of the latch node is inside the loop,
+		// the first successor must be the exit point (follow node)
 		case contains(nodes, latchSuccs[1]):
-			// loopFollow(x) = outEdges(y, 1)
 			return latchSuccs[0], nil
+
 		default:
 			return nil, errors.New("unable to locate follow node of post-tested loop")
 		}
-	// endless loop.
+
 	case EndlessLoop:
-		// fol = Max // a large constant.
+		// For endless loops, we need to find an exit point by examining conditional branches
+		// Initial value is maximum integer to ensure any valid node has lower order
 		followRevPostNum := math.MaxInt64
 		var follow *graph.Node[N]
-		// for (all 2-way nodes n \in nodesInLoop)
+
+		// Examine all 2-way conditional nodes within the loop to find potential exit points
 		for _, n := range nodes {
 			nSuccs := g.Successors(n)
 			if len(nSuccs) != 2 {
-				// Skip node as not 2-way conditional.
+				// Skip nodes that aren't 2-way conditionals
 				continue
 			}
+
 			switch {
-			// if ((outEdges(n, 1) \not \in nodesInLoop) \land (outEdges(x, 1) < fol))
+			// If first successor is outside the loop and has lower reverse post order number
+			// than our current candidate, it becomes the new follow node candidate
 			case !contains(nodes, nSuccs[0]) && nSuccs[0].Order < followRevPostNum:
 				followRevPostNum = nSuccs[0].Order
 				follow = nSuccs[0]
-			// if ((outEdges(x, 2) \not \in nodesInLoop) \land (outEdges(x, 2) < fol))			}
+
+			// If second successor is outside the loop and has lower reverse post order number
+			// than our current candidate, it becomes the new follow node candidate
 			case !contains(nodes, nSuccs[1]) && nSuccs[1].Order < followRevPostNum:
 				followRevPostNum = nSuccs[1].Order
 				follow = nSuccs[1]
 			}
 		}
-		// if (fol != Max)
+
+		// If we found a valid follow node (exit point)
 		if followRevPostNum != math.MaxInt64 {
-			// loopFollow(x) = fol
 			return follow, nil
 		}
-		// No follow node located.
+
+		// No exit point found - this is a truly endless loop
 		return nil, nil
 	default:
 		return nil, errors.New("unsupported loop kind")
@@ -324,7 +356,6 @@ func StructureTwoWayConditionals[N comparable](g *graph.Graph[N], dom *dominator
 	for _, node := range descReversePostOrder(g.Nodes()) {
 		if len(g.Successors(node)) == 2 && !node.IsLoopHead && !node.IsLoopLatch {
 			var follow *graph.Node[N]
-			// if (\exists n, n = max{i | immedDom(i) = m \land #inEdges(i) >= 2})
 			for _, n := range dom.DominatedBy(node) {
 				if len(g.Predecessors(n)) < 2 {
 					continue
